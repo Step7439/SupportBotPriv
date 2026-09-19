@@ -1,0 +1,15 @@
+# Секреты
+.env
+
+# Данные бота (заявки, модераторы)
+data/
+
+# Логи
+bot.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

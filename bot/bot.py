@@ -4,6 +4,7 @@ import time
 from typing import TYPE_CHECKING
 
 from bot.mod_handler import ModHandler
+from bot.telegram_api import AuthError
 from bot.update import Update
 from bot.user_handler import UserHandler
 
@@ -37,6 +38,10 @@ class Bot:
                     self._handle(update)
             except KeyboardInterrupt:
                 raise
+            except AuthError as e:
+                # Токен отклонён — ретраи бессмысленны, останавливаемся
+                print(f"Бот остановлен: {e}")
+                raise SystemExit(1)
             except Exception as e:
                 print(f"Сбой связи с Telegram, повтор через 5 секунд: {e}")
                 time.sleep(5)

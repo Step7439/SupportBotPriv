@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from bot import keyboards
 from bot.update import Update
 
 if TYPE_CHECKING:
@@ -31,7 +32,9 @@ class ModHandler:
         self._moderators = moderators
         # Модератор, который сейчас вводит текст ответа: user_id -> номер заявки
         self._pending_answer: dict[int, int] = {}
-        # Модератор, который сейчас вводит ID нового модератора: user_id -> True
+        # message_id промпта «Напишите ответ» для удаления после отправки
+        self._pending_prompt_ids: dict[int, int] = {}
+        # Модератор, который сейчас вводит ID нового модератора
         self._pending_add: set[int] = set()
         self._lock = threading.Lock()
 
@@ -44,23 +47,21 @@ class ModHandler:
 
         if text in ("/mod", "🛠 Меню", "/help"):
             # Открытие меню сбрасывает незавершённые режимы (ожидание ответа/ID)
-            with self._lock:
-                self._pending_answer.pop(update.user_id, None)
-                self._pending_add.discard(update.user_id)
+            self._reset_pending(update.user_id)
             self._send_menu(update.chat_id)
             return
 
         if text == "/start":
-            # Приветственная страница с логотипом и для модератора
-            caption = (
-                "🛠 ИТМеханизатор — Support\n\n"
-                "Панель модератора техподдержки.\n"
-                "Нажмите «🛠 Меню», чтобы управлять заявками."
-            )
-            if _LOGO_PATH.exists():
-                self._api.send_photo(update.chat_id, _LOGO_PATH, caption)
-            else:
-                self._send(update.chat_id, caption, reply_buttons=[["🛠 Меню"]])
+            self._send_welcome(update.chat_id)
+            return
+
+        if text in ("/myid", "/id"):
+            self._send(update.chat_id, f"Ваш ID в Telegram: {update.user_id}")
+            return
+
+        if text in ("/cancel", "отмена", "Отмена", "❌ Отмена"):
+            self._reset_pending(update.user_id)
+            self._send_menu(update.chat_id)
             return
 
         with self._lock:
@@ -75,23 +76,48 @@ class ModHandler:
             self._add_moderator(update, text)
             return
 
+        # Диалог по закреплённой заявке: если пользователь ждёт ответа
+        # модератора в заявке, закреплённой за ним, — текст уходит в диалог
+        ticket = self._find_assigned_pending_ticket(update.user_id)
+        if ticket is not None:
+            self._send_answer(update, ticket.id, text)
+            return
+
         # Неизвестное сообщение — подсказываем и сразу даём кнопку меню
-        self._send_with_reply(
-            update.chat_id,
-            "Не понял сообщение. Вот меню модератора:",
+        self._send(update.chat_id, "Не понял сообщение. Вот меню модератора:", keyboards.menu_keyboard())
+
+    # --- Приветствие ---
+
+    def _send_welcome(self, chat_id: int) -> None:
+        caption = (
+            "🛠 ИТМеханизатор — Support\n\n"
+            "Панель модератора техподдержки.\n"
+            "Используйте кнопки под сообщениями или команду /mod."
         )
-        self._send_menu(update.chat_id)
+        if _LOGO_PATH.exists():
+            try:
+                self._api.send_photo(chat_id, _LOGO_PATH, caption)
+            except Exception as e:
+                print(f"Не удалось отправить логотип: {e}")
+                self._send(chat_id, caption, keyboards.menu_keyboard())
+                return
+            self._send(chat_id, "Выберите действие:", keyboards.menu_keyboard())
+        else:
+            self._send(chat_id, caption, keyboards.menu_keyboard())
+
+    def _send_menu(self, chat_id: int) -> None:
+        self._send(chat_id, "🛠 Меню модератора:", keyboards.menu_keyboard())
 
     # --- Кнопки ---
 
     def _handle_button(self, update: Update) -> None:
         """Обрабатывает нажатия inline-кнопок."""
+        # Подтверждаем нажатие сразу, чтобы у модератора не крутились часы
         self._api.answer_callback(update.callback_query_id)
+
         data = update.callback_data
 
-        if data == "mod:menu":
-            self._send_menu(update.chat_id)
-        elif data == "mod:list":
+        if data == "mod:list":
             self._cmd_list(update.chat_id)
         elif data == "mod:mods":
             self._cmd_mods(update.chat_id)
@@ -109,6 +135,9 @@ class ModHandler:
             user_id = self._parse_callback_id(update, data)
             if user_id is not None:
                 self._remove_moderator(update, user_id)
+        elif data.startswith("mod:cancel:"):
+            self._reset_pending(update.user_id)
+            self._send(update.chat_id, "❌ Режим ввода отменён. Вот меню:", keyboards.menu_keyboard())
         else:
             self._send(update.chat_id, "Неизвестная кнопка. Откройте меню: /mod")
 
@@ -121,59 +150,79 @@ class ModHandler:
             self._send(update.chat_id, "Некорректная кнопка. Откройте меню: /mod")
             return None
 
-    def _send_menu(self, chat_id: int) -> None:
-        self._send(chat_id, "🛠 Меню модератора:", buttons=[
-            [{"text": "📋 Открытые заявки", "callback_data": "mod:list"}],
-            [{"text": "🛠 Модераторы", "callback_data": "mod:mods"}],
-        ], reply_buttons=[["🛠 Меню"]])
-
     def _cmd_list(self, chat_id: int) -> None:
         """Кнопка «Открытые заявки» — показать каждую с кнопками действий."""
         open_tickets = self._tickets.find_new()
         if not open_tickets:
-            self._send(chat_id, "Открытых заявок нет 🎉", buttons=[
-                [{"text": "🔄 Обновить", "callback_data": "mod:list"}],
-            ])
+            self._send(chat_id, "Открытых заявок нет 🎉", keyboards.refresh_button())
             return
         self._send(chat_id, f"📋 Открытые заявки: {len(open_tickets)}")
         for ticket in open_tickets:
             self._send(
                 chat_id,
                 f"#{ticket.id} — {ticket.user_name}\n\n{ticket.text}",
-                buttons=[
-                    [
-                        {"text": "💬 Ответить", "callback_data": f"mod:answer:{ticket.id}"},
-                        {"text": "✅ Закрыть", "callback_data": f"mod:close:{ticket.id}"},
-                    ],
-                ],
+                keyboards.ticket_keyboard(ticket.id),
             )
 
     def _start_answer(self, update: Update, ticket_id: int) -> None:
-        """Кнопка «Ответить» — запоминаем заявку и ждём текст ответа."""
+        """Кнопка «Ответить» — закрепляем заявку за модератором и ждём ответа."""
         ticket = self._tickets.find_by_id(ticket_id)
         if ticket is None or ticket.status != "NEW":
             self._send(update.chat_id, f"Заявка #{ticket_id} не найдена или уже закрыта.")
             return
+        assignee = self._tickets.get_assignee(ticket_id)
+        if assignee is not None and assignee != update.user_id:
+            self._send(update.chat_id, (
+                f"⏳ Заявку #{ticket_id} уже ведёт другой модератор — "
+                "дождитесь его ответа."
+            ))
+            return
+        if not self._tickets.assign(ticket_id, update.user_id):
+            self._send(update.chat_id, f"Заявку #{ticket_id} уже ведёт другой модератор.")
+            return
         with self._lock:
             self._pending_answer[update.user_id] = ticket_id
-        self._send(
+        prompt_id = self._api.send_message(
             update.chat_id,
             f"💬 Напишите ответ по заявке #{ticket_id} — я отправлю его {ticket.user_name}.",
+            keyboards.cancel_button(ticket_id),
         )
+        if prompt_id:
+            with self._lock:
+                self._pending_prompt_ids[update.user_id] = prompt_id
+
+    def _find_assigned_pending_ticket(self, user_id: int):
+        """Закреплённая за модератором заявка, в которой пользователь
+        ждёт ответа (последнее сообщение в диалоге — от пользователя)."""
+        for ticket in self._tickets.find_new():
+            if self._tickets.get_assignee(ticket.id) != user_id:
+                continue
+            if ticket.messages and ticket.messages[-1]["author"] == "user":
+                return ticket
+        return None
 
     def _send_answer(self, update: Update, ticket_id: int, text: str) -> None:
+        self._delete_prompt(update.user_id)
         ticket = self._tickets.find_by_id(ticket_id)
         if ticket is None:
             self._send(update.chat_id, f"Заявка #{ticket_id} не найдена.")
             return
+        if ticket.status != "NEW":
+            self._tickets.release(ticket_id)
+            self._send(update.chat_id, f"Заявка #{ticket_id} уже закрыта — ответ не отправлен.")
+            return
+        self._tickets.add_message(ticket_id, "mod", update.user_name, text,
+                                  sender_id=update.user_id)
         self._api.send_message(
             ticket.user_id,
-            f"💬 Ответ поддержки по заявке #{ticket_id}:\n\n{text}",
+            f"💬 Ответ поддержки по заявке #{ticket_id}:\n\n{text}\n\n"
+            "Напишите ответ здесь, и он попадёт в эту заявку.",
+            reply_buttons=keyboards.status_button(),
         )
         self._send(
             update.chat_id,
             f"Ответ отправлен автору заявки #{ticket_id}.",
-            buttons=[[{"text": "✅ Закрыть заявку", "callback_data": f"mod:close:{ticket_id}"}]],
+            keyboards.ticket_keyboard(ticket_id),
         )
 
     def _close_ticket(self, chat_id: int, ticket_id: int) -> None:
@@ -182,10 +231,22 @@ class ModHandler:
         if ticket is None:
             self._send(chat_id, f"Заявка #{ticket_id} не найдена.")
             return
+        if ticket.status != "NEW":
+            # Уже закрыта — не дублируем уведомление автору
+            self._send(chat_id, f"Заявка #{ticket_id} уже закрыта.")
+            return
         self._tickets.close(ticket_id)
+        self._tickets.release(ticket_id)
+        # Снимаем режим ожидания ответа у модератора, который взял заявку
+        with self._lock:
+            self._pending_answer.pop(chat_id, None)
+        # Удаляем висячий промпт «Напишите ответ» у того, кто взял заявку
+        self._delete_prompt(chat_id)
         self._api.send_message(
             ticket.user_id,
-            f"✅ Ваша заявка #{ticket_id} закрыта. Если проблема осталась — напишите нам снова.",
+            f"✅ Ваша заявка #{ticket_id} закрыта. Диалог по ней завершён. "
+            "Если проблема осталась — создайте новую заявку кнопкой «📝 Заявка».",
+            reply_buttons=keyboards.closed_ticket_buttons(),
         )
         self._send(chat_id, f"Заявка #{ticket_id} закрыта.")
 
@@ -196,15 +257,13 @@ class ModHandler:
             self._send(chat_id, "Модераторов нет. Добавьте первого кнопкой ниже.")
         else:
             self._send(chat_id, "🛠 Модераторы — нажмите, чтобы удалить:")
-            for user_id in all_mods:
+            for mod_id in all_mods:
                 self._send(
                     chat_id,
-                    f"• {user_id}",
-                    buttons=[[{"text": "🗑 Удалить", "callback_data": f"mod:remove:{user_id}"}]],
+                    f"• {mod_id}",
+                    keyboards.remove_moderator_button(mod_id),
                 )
-        self._send(chat_id, "Добавить модератора:", buttons=[
-            [{"text": "➕ Добавить модератора", "callback_data": "mod:add"}],
-        ])
+        self._send(chat_id, "Добавить модератора:", keyboards.add_moderator_button())
 
     def _start_add(self, update: Update) -> None:
         with self._lock:
@@ -212,6 +271,7 @@ class ModHandler:
         self._send(
             update.chat_id,
             "Отправьте Telegram ID нового модератора одним сообщением (узнать ID: @userinfobot).",
+            keyboards.cancel_button(0),
         )
 
     def _add_moderator(self, update: Update, text: str) -> None:
@@ -234,8 +294,7 @@ class ModHandler:
             self._send(update.chat_id, f"Модератор {user_id} добавлен. Он увидит команды /mod.")
             self._api.send_message(
                 user_id,
-                "Вас добавили в модераторы техподдержки «ИТМеханизатор». Нажмите «🛠 Меню», чтобы начать.",
-                reply_buttons=[["🛠 Меню"]],
+                "Вас добавили в модераторы техподдержки «ИТМеханизатор». Напишите /mod, чтобы начать.",
             )
         else:
             self._send(update.chat_id, f"{user_id} уже модератор.")
@@ -246,6 +305,8 @@ class ModHandler:
             self._send(update.chat_id, "Нельзя удалить последнего модератора — бот останется без поддержки.")
             return
         if self._moderators.remove(user_id):
+            # Чистим сессии удалённого модератора: висячие режимы и блокировки заявок
+            self._reset_pending(user_id)
             self._send(update.chat_id, f"Модератор {user_id} удалён.")
         else:
             self._send(update.chat_id, f"{user_id} не является модератором.")
@@ -255,10 +316,25 @@ class ModHandler:
         chat_id: int,
         text: str,
         buttons: Optional[list[list[dict]]] = None,
-        reply_buttons: Optional[list[list[str]]] = None,
     ) -> None:
-        self._api.send_message(chat_id, text, buttons, reply_buttons)
+        self._api.send_message(chat_id, text, buttons)
 
-    def _send_with_reply(self, chat_id: int, text: str, buttons: Optional[list[list[dict]]] = None) -> None:
-        """Сообщение с постоянной кнопкой «🛠 Меню» в поле ввода."""
-        self._api.send_message(chat_id, text, buttons, reply_buttons=[["🛠 Меню"]])
+    def _reset_pending(self, user_id: int) -> None:
+        """Сбрасывает незавершённые режимы (ожидание ответа / ID модератора).
+
+        Если модератор взял заявку, но не ответил — освобождаем её
+        для других модераторов.
+        """
+        with self._lock:
+            ticket_id = self._pending_answer.pop(user_id, None)
+            self._pending_add.discard(user_id)
+        if ticket_id is not None:
+            self._tickets.release(ticket_id, user_id)
+        self._delete_prompt(user_id)
+
+    def _delete_prompt(self, user_id: int) -> None:
+        """Удаляет промпт «Напишите ответ» после отправки/отмены ответа."""
+        with self._lock:
+            prompt_id = self._pending_prompt_ids.pop(user_id, None)
+        if prompt_id:
+            self._api.delete_message(user_id, prompt_id)

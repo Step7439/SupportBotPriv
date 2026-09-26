@@ -13,13 +13,17 @@ STATUS_CLOSED = "CLOSED"
 
 @dataclass
 class Ticket:
-    """Заявка: номер, автор, текст и статус (NEW / CLOSED)."""
+    """Заявка: номер, автор, текст, статус (NEW / CLOSED) и диалог сообщений."""
     id: int
     user_id: int
     user_name: str
     text: str
     status: str
     created_at: Optional[str] = field(default=None)
+    # Модератор, за которым закреплена заявка (диалог один-на-один)
+    assignee: Optional[int] = field(default=None)
+    # Диалог: [{"author": "user"|"mod", "name": ..., "text": ..., "senderId": ...}, ...]
+    messages: list = field(default_factory=list)
 
 
 class TicketService:
@@ -45,6 +49,8 @@ class TicketService:
                 text=item["text"],
                 status=item["status"],
                 created_at=item.get("createdAt"),
+                assignee=item.get("assignee"),
+                messages=item.get("messages", []),
             )
             self._tickets[ticket.id] = ticket
         if self._tickets:
@@ -68,8 +74,48 @@ class TicketService:
             self._save()
             return ticket
 
+    def find_last_open_by_user(self, user_id: int) -> Optional[Ticket]:
+        """Последняя открытая заявка пользователя (для диалога)."""
+        last = None
+        for ticket in self._tickets.values():
+            if ticket.user_id == user_id and ticket.status == STATUS_NEW:
+                last = ticket
+        return last
+
     def find_by_id(self, ticket_id: int) -> Optional[Ticket]:
         return self._tickets.get(ticket_id)
+
+    def assign(self, ticket_id: int, moderator_id: int) -> bool:
+        """Закрепляет заявку за модератором (диалог один-на-один).
+
+        False — если заявку уже ведёт другой модератор.
+        """
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None or ticket.status != STATUS_NEW:
+                return False
+            assignee = getattr(ticket, "assignee", None)
+            if assignee is not None and assignee != moderator_id:
+                return False
+            ticket.assignee = moderator_id
+            self._save()
+            return True
+
+    def release(self, ticket_id: int, moderator_id: int = None) -> None:
+        """Снимает закрепление заявки (после закрытия или отказа модератора)."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                return
+            if moderator_id is not None and getattr(ticket, "assignee", None) != moderator_id:
+                return
+            ticket.assignee = None
+            self._save()
+
+    def get_assignee(self, ticket_id: int) -> Optional[int]:
+        """Модератор, за которым закреплена заявка (или None)."""
+        ticket = self._tickets.get(ticket_id)
+        return getattr(ticket, "assignee", None) if ticket else None
 
     def find_new(self) -> list[Ticket]:
         return sorted(
@@ -85,6 +131,20 @@ class TicketService:
             ticket = self._tickets.get(ticket_id)
             if ticket is not None:
                 ticket.status = STATUS_CLOSED
+                self._save()
+
+    def add_message(self, ticket_id: int, author: str, name: str, text: str,
+                    sender_id: int = 0) -> None:
+        """Добавляет сообщение в диалог заявки и сохраняет."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is not None:
+                ticket.messages.append({
+                    "author": author,
+                    "name": name,
+                    "text": text,
+                    "senderId": sender_id,
+                })
                 self._save()
 
     def _save(self) -> None:

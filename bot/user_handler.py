@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from bot import keyboards
 from bot.update import Update
 
 if TYPE_CHECKING:
@@ -24,42 +26,31 @@ class UserHandler:
         self._api = api
         self._tickets = tickets
         self._moderators = moderators
+        # Пользователи, нажавшие «📝 Заявка» и сейчас вводящие описание
+        self._pending_ticket: set[int] = set()
+        self._lock = threading.Lock()
 
     def handle(self, update: Update) -> None:
-        # Нажатие кнопки от не-модератора (старое/поддельное сообщение) — игнорируем
+        # Нажатие inline-кнопки от не-модератора (старое/поддельное) — игнорируем
         if update.callback_query_id is not None:
             return
 
         text = update.text.strip()
 
         if text in ("/start", "/help"):
-            caption = (
-                "👷 Добро пожаловать в техподдержку «ИТМеханизатор»!\n"
-                "\n"
-                "Как обратиться к нам:\n"
-                "1. Просто напишите сюда описание проблемы — мы её увидим.\n"
-                "2. /ticket — создать заявку с описанием\n"
-                "3. /status — статус вашей последней заявки\n"
-                "4. /faq — частые вопросы"
-            )
-            if _LOGO_PATH.exists():
-                self._api.send_photo(
-                    update.chat_id,
-                    _LOGO_PATH,
-                    "🛠 ИТМеханизатор — Support\n\n" + caption,
-                )
-            else:
-                self._api.send_message(update.chat_id, caption,
-                                       reply_buttons=[["📝 Заявка", "📊 Статус", "❓ FAQ"]])
-                return
-            self._api.send_message(
-                update.chat_id,
-                "Выберите действие или просто напишите вашу проблему:",
-                reply_buttons=[["📝 Заявка", "📊 Статус", "❓ FAQ"]],
-            )
+            self._reset_pending(update.user_id)
+            self._send_welcome(update.chat_id, update.user_id)
+            return
+
+        if text in ("/myid", "/id"):
+            self._send(update.chat_id,
+                       f"Ваш ID в Telegram: {update.user_id}\n"
+                       "Отправьте этот номер модератору, чтобы он добавил вас, "
+                       "или укажите его как OPERATOR_ID в .env.")
             return
 
         if text in ("❓ FAQ", "/faq"):
+            self._reset_pending(update.user_id)
             self._send(update.chat_id, (
                 "❓ Частые вопросы:\n"
                 "\n"
@@ -72,6 +63,8 @@ class UserHandler:
             return
 
         if text in ("📝 Заявка", "/ticket"):
+            with self._lock:
+                self._pending_ticket.add(update.user_id)
             self._send(update.chat_id, (
                 "📝 Опишите вашу проблему одним сообщением — я создам заявку, "
                 "и оператор скоро ответит вам здесь."
@@ -79,21 +72,78 @@ class UserHandler:
             return
 
         if text in ("📊 Статус", "/status"):
+            self._reset_pending(update.user_id)
             last = self._find_last_user_ticket(update.user_id)
             if last is None:
-                self._send(update.chat_id, "У вас пока нет заявок. Нажмите «📝 Заявка» или просто напишите нам.")
+                self._send(update.chat_id, "У вас пока нет заявок. Нажмите «📝 Заявка», чтобы создать заявку.")
             else:
                 status = "🟡 в работе" if last.status == "NEW" else "✅ закрыта"
                 self._send(update.chat_id, f"Ваша заявка #{last.id} — {status}\n\nТекст: {last.text}")
             return
 
-        if text.startswith("/ticket "):
-            description = text[len("/ticket"):].strip()
-            self._create_ticket(update, description)
+        # Диалог по заявке важнее ввода новой: если модератор ждёт ответа
+        # пользователя в открытой заявке, сообщение уходит в диалог,
+        # а незавершённый ввод описания новой заявки сбрасываем
+        ticket = self._tickets.find_last_open_by_user(update.user_id)
+        if ticket is not None and any(m["author"] == "mod" for m in ticket.messages):
+            self._reset_pending(update.user_id)
+            last_message_author = ticket.messages[-1]["author"]
+            if last_message_author == "user":
+                # Пользователь уже отправил ответ — ждём реакции модератора
+                self._send(update.chat_id, (
+                    "⏳ Ваш ответ отправлен. Ждите ответ оператора — "
+                    "следующее сообщение придёт вам от поддержки."
+                ))
+                return
+            self._send_reply(update, ticket, text)
             return
 
-        # Любое другое сообщение — это тоже заявка
-        self._create_ticket(update, text)
+        # Описание заявки принимаем только после нажатия кнопки «📝 Заявка»
+        with self._lock:
+            expecting = update.user_id in self._pending_ticket
+            if expecting:
+                self._pending_ticket.discard(update.user_id)
+        if expecting:
+            self._create_ticket(update, text)
+            return
+
+        # Произвольный текст заявкой не считаем
+        self._send(update.chat_id, (
+            "Чтобы создать заявку, нажмите кнопку «📝 Заявка» "
+            "и опишите проблему одним сообщением."
+        ))
+
+    def _send_welcome(self, chat_id: int, user_id: int) -> None:
+        caption = (
+            "🛠 ИТМеханизатор — Support\n\n"
+            "👷 Добро пожаловать в техподдержку «ИТМеханизатор»!\n"
+            "\n"
+            "Как обратиться к нам:\n"
+            "1. «📝 Заявка» — создать заявку\n"
+            "2. «📊 Статус» — статус вашей последней заявки\n"
+            "3. «❓ FAQ» — частые вопросы"
+        )
+        # Если последняя заявка закрыта — напоминаем об этом
+        last = self._find_last_user_ticket(user_id)
+        if last is not None and last.status != "NEW":
+            caption += (
+                f"\n\n✅ Ваша заявка #{last.id} закрыта. "
+                "Если проблема осталась — создайте новую заявку кнопкой «📝 Заявка»."
+            )
+        if _LOGO_PATH.exists():
+            try:
+                self._api.send_photo(chat_id, _LOGO_PATH, caption)
+            except Exception as e:
+                print(f"Не удалось отправить логотип: {e}")
+                self._send(chat_id, caption, reply_buttons=keyboards.USER_BUTTONS)
+                return
+            self._send(
+                chat_id,
+                "Выберите действие:",
+                reply_buttons=keyboards.USER_BUTTONS,
+            )
+        else:
+            self._send(chat_id, caption, reply_buttons=keyboards.USER_BUTTONS)
 
     def _find_last_user_ticket(self, user_id: int):
         last = None
@@ -109,6 +159,12 @@ class UserHandler:
         return last
 
     def _create_ticket(self, update: Update, description: str) -> None:
+        if not description.strip():
+            self._send(update.chat_id, (
+                "📝 Опишите вашу проблему одним сообщением — я создам заявку, "
+                "и оператор скоро ответит вам здесь."
+            ))
+            return
         ticket = self._tickets.create(update.user_id, update.user_name, description)
         self._send(update.chat_id, f"✅ Заявка #{ticket.id} создана. Оператор скоро ответит вам здесь.")
 
@@ -118,12 +174,38 @@ class UserHandler:
             f"\n"
             f"{description}"
         )
-        buttons = [[
-            {"text": "💬 Ответить", "callback_data": f"mod:answer:{ticket.id}"},
-            {"text": "✅ Закрыть", "callback_data": f"mod:close:{ticket.id}"},
-        ]]
-        for moderator_id in self._moderators.get_all():
-            self._api.send_message(moderator_id, notice, buttons)
+        self._api.send_message_to_all(
+            self._moderators.get_all(),
+            notice,
+            keyboards.ticket_keyboard(ticket.id),
+        )
 
-    def _send(self, chat_id: int, text: str) -> None:
-        self._api.send_message(chat_id, text)
+    def _send_reply(self, update: Update, ticket, text: str) -> None:
+        """Ответ пользователя в диалог по своей открытой заявке —
+        уходит только модератору, который ведёт эту заявку."""
+        self._tickets.add_message(ticket.id, "user", update.user_name, text,
+                                  sender_id=update.user_id)
+        notice = (
+            f"💬 Ответ пользователя по заявке #{ticket.id} ({update.user_name}):\n"
+            f"\n"
+            f"{text}"
+        )
+        assignee = self._tickets.get_assignee(ticket.id)
+        if assignee is not None:
+            self._api.send_message(
+                assignee, notice, keyboards.ticket_keyboard(ticket.id))
+        else:
+            # Заявка не закреплена — уведомляем всех модераторов
+            self._api.send_message_to_all(
+                self._moderators.get_all(),
+                notice,
+                keyboards.ticket_keyboard(ticket.id),
+            )
+
+    def _send(self, chat_id: int, text: str, buttons=None, reply_buttons=None) -> None:
+        self._api.send_message(chat_id, text, buttons, reply_buttons)
+
+    def _reset_pending(self, user_id: int) -> None:
+        """Сбрасывает режим ввода описания заявки."""
+        with self._lock:
+            self._pending_ticket.discard(user_id)
